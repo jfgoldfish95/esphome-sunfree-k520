@@ -9,7 +9,7 @@ exactly as upstream.
 
 ```yaml
 external_components:
-  - source: github://jfgoldfish95/esphome-sunfree-k520@release-0.1.0
+  - source: github://jfgoldfish95/esphome-sunfree-k520@v0.1.0
     components: [sunfree_blinds]
 
 sunfree_blinds:
@@ -73,3 +73,9 @@ Status: builds for ESP32-S3 (ESPHome 2026.10); hardware test pending.
 ## Licence
 
 MIT, as upstream. See `LICENSE`.
+
+## Releases
+
+Each release is a tag (`v0.1.0`, …) with notes on the GitHub Releases page.
+Pin to a tag in `external_components` so a config only changes when you
+change the version.
