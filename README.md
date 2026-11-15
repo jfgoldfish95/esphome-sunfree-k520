@@ -9,7 +9,7 @@ exactly as upstream.
 
 ```yaml
 external_components:
-  - source: github://jfgoldfish95/esphome-sunfree-k520@v0.1.0
+  - source: github://jfgoldfish95/esphome-sunfree-k520@release-0.1.0
     components: [sunfree_blinds]
 
 sunfree_blinds:
