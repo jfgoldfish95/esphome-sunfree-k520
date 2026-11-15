@@ -1,0 +1,993 @@
+#pragma once
+#include "esphome/core/component.h"
+#include "esphome/core/log.h"
+#include "esphome/core/preferences.h"
+#include "esphome/components/api/custom_api_device.h"
+#ifdef USE_WEBSERVER_BASE
+#include "esphome/components/web_server_base/web_server_base.h"
+#endif
+#include "esphome/components/cc1101/cc1101.h"
+#include "sunfree_protocol.h"
+#include <map>
+#include <functional>
+#include "driver/gpio.h"
+#include "rom/ets_sys.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+namespace esphome {
+namespace sunfree_blinds {
+
+static const char *const TAG = "sunfree";
+
+// action codes for pending cover commands
+static constexpr uint8_t ACTION_NONE = 0xFF;
+static constexpr uint8_t ACTION_STOP = 0;
+static constexpr uint8_t ACTION_OPEN = 1;
+static constexpr uint8_t ACTION_CLOSE = 2;
+static constexpr uint8_t ACTION_POSITION = 3;
+// config action codes (for send_config)
+static constexpr uint8_t ACTION_GOTO_FAV = 4;
+
+class SunfreeCover;
+
+class SunfreeHub : public Component, public api::CustomAPIDevice {
+ public:
+  void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
+#ifdef USE_WEBSERVER_BASE
+  void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
+#endif
+  void set_hub_id(const std::string &id) {
+    if (!parse_motor_id(id, this->hub_id_)) {
+      ESP_LOGE(TAG, "Invalid hub_id '%s' — must be 8 hex chars; ignoring", id.c_str());
+      return;
+    }
+    this->hub_id_from_yaml_ = true;
+  }
+  void set_gdo0_pin(uint8_t pin) { this->gdo0_pin_ = static_cast<gpio_num_t>(pin); }
+  // K520 "Radio+" motors (Blinds2go): post-pairing handshake, status request
+  // by handshake, position from status byte 16.  See docs/k520-findings.md.
+  void set_k520_mode(bool on) { this->k520_mode_ = on; }
+  bool get_k520_mode() const { return this->k520_mode_; }
+  int get_position_byte() const { return this->k520_mode_ ? 16 : 22; }
+
+  float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
+
+  void setup() override {
+    this->init_hub_id_();
+    ESP_LOGI(TAG, "Hub ID: %s", format_motor_id(this->hub_id_).c_str());
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    ESP_LOGI(TAG, "CC1101: CRC and whitening disabled for Sunfree protocol");
+    this->build_solicitation_frame_();
+
+#ifndef CONFIG_FREERTOS_UNICORE
+    // Dedicated TX task pinned to core 1.  ESPHome's main loop and WiFi
+    // run on core 0, so the bit-bang's interrupt-disabled stretches no
+    // longer stall WiFi servicing or FreeRTOS ticks there.
+    this->tx_start_sem_ = xSemaphoreCreateBinary();
+    this->tx_done_sem_ = xSemaphoreCreateBinary();
+    if (xTaskCreatePinnedToCore(SunfreeHub::tx_task_trampoline_, "sunfree_tx",
+                                3072, this, 19, &this->tx_task_, 1) != pdPASS) {
+      ESP_LOGW(TAG, "TX task creation failed — falling back to inline TX");
+      this->tx_task_ = nullptr;
+    }
+#endif
+
+    register_service(&SunfreeHub::on_send_config_, "send_config",
+                     {"motor_id", "action_type"});
+    register_service(&SunfreeHub::on_group_command_, "group_command",
+                     {"group", "action"});
+    ESP_LOGI(TAG, "Registered services: send_config, group_command");
+
+#ifdef USE_WEBSERVER_BASE
+    if (this->web_base_) this->setup_web_();
+#endif
+  }
+
+  // Runs after all components' setup(), so the cover count is accurate here
+  // (covers register at a later setup priority than the hub).
+  void dump_config() override {
+    ESP_LOGCONFIG(TAG, "Sunfree Hub:");
+    ESP_LOGCONFIG(TAG, "  Hub ID: %s", format_motor_id(this->hub_id_).c_str());
+    ESP_LOGCONFIG(TAG, "  GDO0 TX pin: %d", static_cast<int>(this->gdo0_pin_));
+    ESP_LOGCONFIG(TAG, "  Covers: %u", static_cast<unsigned>(this->covers_.size()));
+    ESP_LOGCONFIG(TAG, "  Groups: %u", static_cast<unsigned>(this->groups_.size()));
+    ESP_LOGCONFIG(TAG, "  K520 mode: %s", YESNO(this->k520_mode_));
+  }
+
+  void loop() override {
+    uint32_t now = millis();
+
+    // Follow-up retransmissions with RX gaps — mimics the Tuya hub's
+    // TX/RX cycling.  Each follow-up is rebuilt with a FRESH seq so the
+    // motor doesn't deduplicate.  The hub sends 6-8 TX/RX cycles ~200ms
+    // apart; the motor sends STATUS after several rounds.
+    if (this->followup_remaining_ > 0 && now >= this->followup_next_ms_) {
+      int idx = this->followup_total_ - this->followup_remaining_;
+      uint8_t seq = this->next_seq();
+      auto pkt = this->build_followup_pkt_(seq);
+      ESP_LOGD(TAG, "Follow-up TX %d/%d seq=0x%02x", idx + 1, this->followup_total_, seq);
+      this->transmit_command_only_(pkt, 1);
+      this->followup_remaining_--;
+      if (this->followup_remaining_ > 0) {
+        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
+      }
+    }
+
+    // Queued status poll: process one motor at a time with full TX/RX
+    // cycling + cooldown before moving to the next.  The cooldown gives
+    // late STATUS responses time to arrive before the next WOR blocks RX.
+    if (!this->poll_queue_.empty() && this->followup_remaining_ <= 0 &&
+        this->followup_group_remaining_ <= 0 &&
+        now >= this->poll_cooldown_until_) {
+      auto mid_str = this->poll_queue_.front();
+      this->poll_queue_.erase(this->poll_queue_.begin());
+      uint8_t mid[4];
+      parse_motor_id(mid_str, mid);
+      ESP_LOGI(TAG, "Poll queue: sending STOP to %s (%d remaining)",
+               mid_str.c_str(), static_cast<int>(this->poll_queue_.size()));
+      this->request_status(mid);
+      this->poll_cooldown_until_ = now + POLL_COOLDOWN_MS;
+    }
+
+    // Group follow-ups: rebuild each motor's packet with a FRESH seq
+    // so motors don't deduplicate.  Same fix as single-motor follow-ups.
+    if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
+        now >= this->followup_next_ms_) {
+      int round = FOLLOWUP_COUNT_GROUP - this->followup_group_remaining_ + 1;
+      ESP_LOGD(TAG, "Group follow-up %d/%d (%d motors)",
+               round, FOLLOWUP_COUNT_GROUP,
+               static_cast<int>(this->followup_group_entries_.size()));
+      for (auto &entry : this->followup_group_entries_) {
+        uint8_t seq = this->next_seq();
+        auto pkt = this->build_command_packet_(entry.motor_id, entry.action,
+                                                entry.position, seq);
+        this->transmit_command_only_(pkt, 1);
+      }
+      this->followup_group_remaining_--;
+      if (this->followup_group_remaining_ > 0) {
+        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
+      }
+    }
+
+    // ACK-verified retransmission: re-send to motors that never confirmed.
+    // One straggler per pass, only while no follow-up TX is in flight
+    // (follow-up state is a shared single slot).
+    if (!this->pending_acks_.empty() && !this->scan_active_ &&
+        this->followup_remaining_ <= 0 && this->followup_group_remaining_ <= 0 &&
+        now >= this->retry_cooldown_until_) {
+      for (auto it = this->pending_acks_.begin(); it != this->pending_acks_.end(); ++it) {
+        if (static_cast<int32_t>(now - it->deadline_ms) < 0) continue;
+        if (it->retries_left == 0) {
+          ESP_LOGW(TAG, "Motor %s NEVER ACKED %s after %d retries — giving up",
+                   format_motor_id(it->motor_id).c_str(),
+                   action_name_(it->action), ACK_MAX_RETRIES);
+          this->pending_acks_.erase(it);
+          break;
+        }
+        it->retries_left--;
+        this->retry_count_total_++;
+        ESP_LOGW(TAG, "No ACK from %s — RETRY %s (attempt %d/%d, total retries %u)",
+                 format_motor_id(it->motor_id).c_str(), action_name_(it->action),
+                 ACK_MAX_RETRIES - it->retries_left, ACK_MAX_RETRIES,
+                 this->retry_count_total_);
+        uint8_t seq = this->next_seq();
+        auto pkt = this->build_command_packet_(it->motor_id, it->action, it->position, seq);
+        this->transmit_with_preamble_(pkt);
+        this->schedule_followups_(it->motor_id, it->action, it->position, true);
+        it->deadline_ms = now + ACK_TIMEOUT_MS;
+        this->retry_cooldown_until_ = now + RETRY_SPACING_MS;
+        break;  // one retry per loop pass
+      }
+    }
+
+    // K520 handshake / status-request queue: one WOR-preambled short command
+    // at a time, spaced so the motor can answer (ACK, then STATUS) in between.
+    if (!this->handshake_queue_.empty() && !this->scan_active_ &&
+        this->followup_remaining_ <= 0 && this->followup_group_remaining_ <= 0 &&
+        static_cast<int32_t>(now - this->handshake_queue_.front().due_ms) >= 0) {
+      HandshakeStep step = this->handshake_queue_.front();
+      this->handshake_queue_.erase(this->handshake_queue_.begin());
+      uint8_t seq = this->next_seq();
+      auto pkt = build_short_command(this->hub_id_, step.motor_id, seq, step.action,
+                                     this->swap_fields_);
+      ESP_LOGI(TAG, "TX K520 0x%02X seq=0x%02x motor=%s (%d queued)", step.action, seq,
+               format_motor_id(step.motor_id).c_str(),
+               static_cast<int>(this->handshake_queue_.size()));
+      this->transmit_with_preamble_(pkt);
+    }
+
+    if (!this->scan_active_) return;
+
+    // Check scan timeout
+    if (now - this->scan_start_ms_ > SCAN_TIMEOUT_MS) {
+      this->scan_active_ = false;
+      this->pairing_status_ = "SCAN TIMEOUT";
+      ESP_LOGW(TAG, "Pairing scan timed out after %ds", SCAN_TIMEOUT_MS / 1000);
+      return;
+    }
+
+    // Send discovery packet every SOLICIT_INTERVAL_MS while scanning.
+    // The motor enters LISTEN mode after M button press (~10s window).
+    // The hub (us) must be actively sending for the motor to hear us.
+    if (now - this->last_solicit_ms_ >= SOLICIT_INTERVAL_MS) {
+      this->last_solicit_ms_ = now;
+      this->solicit_count_++;
+      // Rebuild with fresh seq each time (motor may deduplicate by seq)
+      this->build_solicitation_frame_();
+      ESP_LOGI(TAG, "Pairing TX #%d seq=0x%02x (t=%ds)", this->solicit_count_,
+               this->seq_, (now - this->scan_start_ms_) / 1000);
+      this->transmit_with_preamble_(this->solicit_frame_);
+    }
+  }
+
+  void register_cover(SunfreeCover *cover);
+
+  // Look up a registered cover by its lowercase-hex motor ID (nullptr if none).
+  SunfreeCover *get_cover(const std::string &motor_id) {
+    auto it = this->covers_.find(motor_id);
+    return it == this->covers_.end() ? nullptr : it->second;
+  }
+
+  void set_swap_fields(bool swap) { this->swap_fields_ = swap; }
+  bool get_swap_fields() const { return this->swap_fields_; }
+
+  // Primary TX: long preamble to wake motor from WOR, then command
+  void send_command(const uint8_t *motor_id, uint8_t action, uint8_t position = 0) {
+    uint8_t seq = this->next_seq();
+    std::vector<uint8_t> pkt = this->build_command_packet_(motor_id, action, position, seq);
+    const char *act_name = action_name_(action);
+    ESP_LOGI(TAG, "TX %s seq=0x%02x motor=%s", act_name, seq,
+             format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, action, position, true);
+    this->arm_ack_watch_(motor_id, action, position);
+
+    // Also arm auto-piggyback as fallback for deep-sleeping motors
+    this->arm_piggyback_(motor_id, action, position);
+  }
+
+  void add_group(const std::string &name, std::vector<std::string> motor_ids) {
+    this->groups_[name] = std::move(motor_ids);
+    ESP_LOGI(TAG, "Group '%s' added with %d motors", name.c_str(),
+             static_cast<int>(this->groups_[name].size()));
+  }
+
+  const std::map<std::string, std::vector<std::string>> &get_groups() const {
+    return this->groups_;
+  }
+
+  // Send a command to a named group (single WOR preamble, all motors move together).
+  // Use group="" for all motors.
+  // Implemented in sunfree_cover.h where SunfreeCover is fully defined.
+  void send_group_command(const std::string &group, uint8_t action, uint8_t position = 0);
+
+  // Send a configuration command (limits, direction, favourite, etc.)
+  // Uses n=4 XXTEA encryption with arbitrary action+value bytes.
+  void send_config(const uint8_t *motor_id, uint8_t action, uint8_t value) {
+    uint8_t seq = this->next_seq();
+    std::vector<uint8_t> pkt = build_n4_command(
+        this->hub_id_, motor_id, seq, action, value, this->swap_fields_);
+    ESP_LOGI(TAG, "TX CONFIG action=0x%02x value=0x%02x seq=0x%02x motor=%s",
+             action, value, seq, format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, action, value);
+  }
+
+  // Poll a motor for status (battery + position).
+  // Sends a STOP command — harmless if motor is already stopped, but
+  // triggers the full TX/RX cycling that elicits STATUS reports.
+  // Uses FOLLOWUP_COUNT_POLL (6) instead of FOLLOWUP_COUNT_CMD (2).
+  void request_status(const uint8_t *motor_id) {
+    if (this->k520_mode_) {
+      // K520: 0x2A then 0x2C makes even an idle motor report.  A STOP poll
+      // only gets ACKs.  A lone 0x2C isn't enough either: the first
+      // transmission only wakes the motor unit, which then answers with its
+      // night roller's report whatever was asked.
+      ESP_LOGI(TAG, "Status request (K520 handshake) motor=%s",
+               format_motor_id(motor_id).c_str());
+      this->queue_handshake(motor_id);
+      return;
+    }
+    uint8_t seq = this->next_seq();
+    auto pkt = this->build_command_packet_(motor_id, ACTION_STOP, 0, seq);
+    ESP_LOGI(TAG, "TX POLL (STOP) seq=0x%02x motor=%s", seq,
+             format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, ACTION_STOP, 0, false);
+  }
+
+  // Ask every configured cover for a STATUS report (same as the
+  // send_config service with action_type request_status, motor_id all).
+  void request_status_all() { this->on_request_status_all_(); }
+
+  // Queue 0x2A then 0x2C for one motor, after anything already queued.
+  void queue_handshake(const uint8_t *motor_id) {
+    uint32_t base = millis();
+    if (!this->handshake_queue_.empty()) {
+      uint32_t last = this->handshake_queue_.back().due_ms + HANDSHAKE_GAP_MS;
+      if (static_cast<int32_t>(last - base) > 0) base = last;
+    }
+    const uint8_t actions[2] = {K520_HANDSHAKE_1, K520_HANDSHAKE_2};
+    for (int i = 0; i < 2; i++) {
+      HandshakeStep step{};
+      memcpy(step.motor_id, motor_id, 4);
+      step.action = actions[i];
+      step.due_ms = base + i * HANDSHAKE_GAP_MS;
+      this->handshake_queue_.push_back(step);
+    }
+  }
+
+  float get_last_rssi() const { return this->last_rssi_; }
+
+ protected:
+  void on_send_config_(std::string motor_id, std::string action_type) {
+    // "request_status" with "all" queues STOP poll for every motor
+    if (action_type == "request_status" && motor_id == "all") {
+      this->on_request_status_all_();
+      return;
+    }
+
+    uint8_t mid[4];
+    if (motor_id.length() != 8) {
+      ESP_LOGW(TAG, "send_config: motor_id must be 8 hex chars, got '%s'", motor_id.c_str());
+      return;
+    }
+    parse_motor_id(motor_id, mid);
+
+    uint8_t action, value;
+    if (action_type == "direction_forward") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_DIRECTION);
+      value = DIR_FORWARD;
+    } else if (action_type == "direction_reverse") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_DIRECTION);
+      value = DIR_REVERSE;
+    } else if (action_type == "set_open_limit") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_OPEN;
+    } else if (action_type == "set_close_limit") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_CLOSE;
+    } else if (action_type == "save_favourite") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_FAVOURITE;
+    } else if (action_type == "goto_favourite") {
+      action = static_cast<uint8_t>(SunfreeCmd::GOTO_FAVOURITE);
+      value = GOTO_FAV_VALUE;
+    } else if (action_type == "request_status") {
+      this->request_status(mid);
+      return;
+    } else if (action_type == "handshake") {
+      // K520 post-pairing handshake (0x2A, 0x2C).  Safe to repeat.
+      this->queue_handshake(mid);
+      return;
+    } else {
+      // Deliberately no "status_query" (ACTION 0x2A): it was added in #5 and
+      // removed after tests and a disassembly of the original hub's RF MCU
+      // (HC32L170) showed 0x2A/0x2C are the post-pairing handshake, not a
+      // poll.  An idle motor answers them with an ACK only.  The original
+      // hub has no way to read an idle motor's position either.  Never add
+      // ACTION 0x2B: in the hub firmware it is "delete sub device" (unbind).
+      // See docs/PROTOCOL.md "Actions found in the hub firmware".
+      // blinds2go-ha: on K520 motors, 0x2A then 0x2C *does* make an idle
+      // motor send a STATUS report once the handshake has been done, so with
+      // k520_mode on, "request_status" uses it.  See docs/k520-findings.md.
+      ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
+      return;
+    }
+
+    ESP_LOGI(TAG, "Service send_config: motor=%s action=%s (0x%02X/0x%02X)",
+             motor_id.c_str(), action_type.c_str(), action, value);
+    this->send_config(mid, action, value);
+  }
+
+  void on_request_status_all_() {
+    this->poll_queue_.clear();
+    this->poll_cooldown_until_ = 0;
+    for (auto &kv : this->covers_) {
+      this->poll_queue_.push_back(kv.first);
+    }
+    ESP_LOGI(TAG, "Queued STOP poll for %d motors",
+             static_cast<int>(this->poll_queue_.size()));
+  }
+
+  void on_group_command_(std::string group, std::string action_str) {
+    uint8_t action;
+    uint8_t position = 0;
+    if (action_str == "open") {
+      action = ACTION_OPEN;
+    } else if (action_str == "close") {
+      action = ACTION_CLOSE;
+    } else if (action_str == "stop") {
+      action = ACTION_STOP;
+    } else if (action_str.substr(0, 9) == "position_") {
+      action = ACTION_POSITION;
+      position = static_cast<uint8_t>(std::atoi(action_str.substr(9).c_str()));
+    } else {
+      ESP_LOGW(TAG, "group_command: unknown action '%s'", action_str.c_str());
+      return;
+    }
+    ESP_LOGI(TAG, "Service group_command: group='%s' action=%s", group.c_str(), action_str.c_str());
+    this->send_group_command(group, action, position);
+  }
+
+ public:
+  // Quick TX for piggyback: motor is already awake, skip preamble
+  void send_quick(const uint8_t *motor_id, uint8_t action, uint8_t position = 0) {
+    uint8_t seq = this->next_seq();
+    std::vector<uint8_t> pkt = this->build_command_packet_(motor_id, action, position, seq);
+    const char *act_name = action_name_(action);
+    ESP_LOGI(TAG, "QUICK TX %s seq=0x%02x motor=%s", act_name, seq,
+             format_motor_id(motor_id).c_str());
+    this->transmit_command_only_(pkt, 3);
+  }
+
+  std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
+#ifdef USE_WEBSERVER_BASE
+  std::string get_motors_json();  // implemented in sunfree_web.h
+#endif
+
+  uint32_t get_retry_count() const { return this->retry_count_total_; }
+  uint32_t get_pending_ack_count() const { return this->pending_acks_.size(); }
+  uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
+  uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
+  uint32_t get_rx_status_count() const { return this->rx_status_count_; }
+  uint32_t get_rx_ack_count() const { return this->rx_ack_count_; }
+  uint32_t get_rx_cmd_count() const { return this->rx_cmd_count_; }
+  const std::string &get_last_rx_motor() const { return this->last_rx_motor_; }
+  const std::string &get_last_rx_info() const { return this->last_rx_info_; }
+  const std::string &get_piggyback_status() const { return this->piggyback_status_; }
+
+  void on_cc1101_packet(const std::vector<uint8_t> &data, float rssi);
+
+  // Scan / pairing
+  void start_scan() {
+    this->scan_active_ = true;
+    this->scan_start_ms_ = millis();
+    this->last_solicit_ms_ = 0;  // force immediate first TX
+    this->solicit_count_ = 0;
+    this->pairing_status_ = "SCANNING+TX...";
+    ESP_LOGI(TAG, "Pairing scan STARTED: sending solicitation every %dms for %ds",
+             SOLICIT_INTERVAL_MS, SCAN_TIMEOUT_MS / 1000);
+  }
+
+  void stop_scan() {
+    this->scan_active_ = false;
+    this->pairing_status_ = "STOPPED";
+    ESP_LOGI(TAG, "Pairing scan STOPPED");
+  }
+
+  bool is_scanning() const { return this->scan_active_; }
+  const std::string &get_pairing_status() const { return this->pairing_status_; }
+  uint32_t get_rx_beacon_count() const { return this->rx_beacon_count_; }
+
+  // Proactive pairing: now just an alias for start_scan().
+  // The loop() continuously sends solicitation + listens during scan.
+  void send_pairing_solicitation() {
+    this->start_scan();
+  }
+
+  void send_pairing_response(const uint8_t *resp_dec16) {
+    const uint8_t *motor_addr = resp_dec16 + 3;
+    char mid[20];
+    snprintf(mid, sizeof(mid), "%02x%02x%02x%02x",
+             motor_addr[0], motor_addr[1], motor_addr[2], motor_addr[3]);
+    std::string mid_str(mid);
+    ESP_LOGI(TAG, "Motor paired! ID=%s", mid);
+    this->pairing_status_ = "PAIRED: " + mid_str;
+
+    bool already_listed = false;
+    for (auto &d : this->discovered_ids_) {
+      if (d == mid_str) { already_listed = true; break; }
+    }
+    if (!already_listed) {
+      this->discovered_ids_.push_back(mid_str);
+      ESP_LOGI(TAG, "New motor discovered: %s (total discovered: %d)",
+               mid, static_cast<int>(this->discovered_ids_.size()));
+    }
+  }
+
+  const std::vector<std::string> &get_discovered_ids() const {
+    return this->discovered_ids_;
+  }
+
+  std::string get_discovered_ids_str() const {
+    if (this->discovered_ids_.empty()) return "none";
+    std::string result;
+    for (size_t i = 0; i < this->discovered_ids_.size(); i++) {
+      if (i) result += ", ";
+      result += this->discovered_ids_[i];
+    }
+    return result;
+  }
+
+ protected:
+  cc1101::CC1101Component *radio_{nullptr};
+#ifdef USE_WEBSERVER_BASE
+  web_server_base::WebServerBase *web_base_{nullptr};
+#endif
+  gpio_num_t gdo0_pin_{GPIO_NUM_4};
+  uint8_t hub_id_[4]{};
+  bool hub_id_from_yaml_{false};
+  uint8_t seq_{0x80};
+  uint8_t overheard_seq_{0};
+  bool have_overheard_seq_{false};
+  std::map<std::string, SunfreeCover *> covers_;
+  std::map<std::string, std::vector<std::string>> groups_;
+  bool swap_fields_{false};
+
+  // Auto-piggyback state: fires command on next status report from target motor
+  bool piggyback_armed_{false};
+  uint8_t piggyback_motor_[4]{};
+  uint8_t piggyback_action_{ACTION_NONE};
+  uint8_t piggyback_position_{0};
+  uint32_t piggyback_armed_at_{0};
+  static constexpr uint32_t PIGGYBACK_TIMEOUT_MS = 300000;  // 5 minutes
+
+  // K520 handshake / status-request queue
+  bool k520_mode_{false};
+  struct HandshakeStep {
+    uint8_t motor_id[4];
+    uint8_t action;
+    uint32_t due_ms;
+  };
+  std::vector<HandshakeStep> handshake_queue_;
+  static constexpr uint32_t HANDSHAKE_GAP_MS = 1000;  // emulator: ~930 ms worked
+
+  // Scan / pairing state
+  bool scan_active_{false};
+  uint32_t scan_start_ms_{0};
+  uint32_t last_solicit_ms_{0};
+  uint32_t solicit_count_{0};
+  std::vector<uint8_t> solicit_frame_;
+  static constexpr uint32_t SCAN_TIMEOUT_MS = 120000;    // 120 seconds
+  static constexpr uint32_t SOLICIT_INTERVAL_MS = 1500;   // TX every 1.5s (160ms TX + listen gap)
+  std::string pairing_status_{"idle"};
+  std::vector<std::string> discovered_ids_;
+
+  // Follow-up retransmission state (TX/RX cycling like Tuya hub).
+  // Each follow-up is rebuilt with a fresh seq so the motor doesn't
+  // deduplicate.  We store the context (motor_id, action, value) to
+  // rebuild packets on each retransmission.
+  uint8_t followup_motor_id_[4]{};
+  uint8_t followup_action_{0};
+  uint8_t followup_value_{0};
+  bool followup_is_command_{false};
+
+  struct GroupEntry {
+    uint8_t motor_id[4];
+    uint8_t action;
+    uint8_t position;
+  };
+  std::vector<GroupEntry> followup_group_entries_;
+  uint32_t followup_next_ms_{0};
+  int followup_remaining_{0};
+  int followup_total_{0};
+  int followup_group_remaining_{0};
+  static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
+  static constexpr int FOLLOWUP_COUNT_POLL = 6;    // status poll needs many rounds to elicit STATUS
+  static constexpr int FOLLOWUP_COUNT_CMD = 2;     // single-motor movement commands
+  static constexpr int FOLLOWUP_COUNT_GROUP = 4;   // group commands: more rounds for reliability
+
+  // Queued status poll — process one motor at a time with full TX/RX
+  // cycling between each, so motors get proper follow-ups.
+  std::vector<std::string> poll_queue_;
+  uint32_t poll_cooldown_until_{0};
+  static constexpr uint32_t POLL_COOLDOWN_MS = 500;
+
+  // ACK-verified retransmission.  Motors ACK every command they hear, but
+  // TX was fire-and-forget: all redundancy (2x burst copies + follow-ups)
+  // happens within ~1s, which a motor sleeping through the WOR window
+  // misses entirely — observed as "one blind stayed in the previous mode"
+  // (group commands especially, since they never armed the piggyback).
+  // Every movement command arms a pending-ACK watch; an ACK or STATUS from
+  // the motor clears it; loop() re-sends unicast with the full wake
+  // preamble to motors that never confirmed, a few seconds apart.
+  // Retries are BOUNDED (~15s worst case per motor) on purpose: the
+  // day/night rollers are mechanically coupled, so a command deferred by
+  // minutes (piggyback-style) could fire after the sibling roller settled
+  // and drag it out of position.  Re-sends are safe if the ACK (not the
+  // command) was lost: targets are absolute positions, so a motor already
+  // at target doesn't move.
+  struct PendingAck {
+    uint8_t motor_id[4];
+    uint8_t action;
+    uint8_t position;
+    uint32_t deadline_ms;
+    uint8_t retries_left;
+  };
+  std::vector<PendingAck> pending_acks_;
+  uint32_t retry_cooldown_until_{0};
+  uint32_t retry_count_total_{0};
+  static constexpr uint32_t ACK_TIMEOUT_MS = 4000;    // burst+follow-ups ~1s, ACK expected well within this
+  static constexpr uint32_t RETRY_SPACING_MS = 1500;  // between straggler re-sends
+  static constexpr uint8_t ACK_MAX_RETRIES = 2;
+
+  void arm_ack_watch_(const uint8_t *motor_id, uint8_t action, uint8_t position) {
+    if (action == ACTION_STOP) return;  // STOP doubles as a status poll — don't retry-spam it
+    for (auto &e : this->pending_acks_) {
+      if (memcmp(e.motor_id, motor_id, 4) == 0) {
+        // Latest command wins (e.g. blackout's night open → night close)
+        e.action = action;
+        e.position = position;
+        e.deadline_ms = millis() + ACK_TIMEOUT_MS;
+        e.retries_left = ACK_MAX_RETRIES;
+        return;
+      }
+    }
+    PendingAck e{};
+    memcpy(e.motor_id, motor_id, 4);
+    e.action = action;
+    e.position = position;
+    e.deadline_ms = millis() + ACK_TIMEOUT_MS;
+    e.retries_left = ACK_MAX_RETRIES;
+    this->pending_acks_.push_back(e);
+  }
+
+  void clear_ack_watch_(const uint8_t *motor_id) {
+    for (auto it = this->pending_acks_.begin(); it != this->pending_acks_.end(); ++it) {
+      if (memcmp(it->motor_id, motor_id, 4) == 0) {
+        ESP_LOGD(TAG, "ACK watch cleared for %s", format_motor_id(it->motor_id).c_str());
+        this->pending_acks_.erase(it);
+        return;
+      }
+    }
+  }
+
+
+  // Diagnostic counters
+  uint32_t rx_packet_count_{0};
+  uint32_t rx_valid_count_{0};
+  uint32_t rx_status_count_{0};
+  uint32_t rx_ack_count_{0};
+  uint32_t rx_cmd_count_{0};
+  uint32_t rx_beacon_count_{0};
+  float last_rssi_{0.0f};
+  std::string last_rx_motor_{"none"};
+  std::string last_rx_info_{"waiting"};
+  std::string piggyback_status_{"idle"};
+
+  static const char *action_name_(uint8_t action) {
+    switch (action) {
+      case ACTION_OPEN: return "OPEN";
+      case ACTION_CLOSE: return "CLOSE";
+      case ACTION_STOP: return "STOP";
+      case ACTION_POSITION: return "POS";
+      default: return "???";
+    }
+  }
+
+  std::vector<uint8_t> build_command_packet_(const uint8_t *motor_id, uint8_t action,
+                                              uint8_t position, uint8_t seq) {
+    if (action == ACTION_STOP) {
+      return build_stop_packet(this->hub_id_, motor_id, seq, this->swap_fields_);
+    }
+    uint8_t motor_pos = 0;
+    if (action == ACTION_OPEN) motor_pos = 0x00;
+    else if (action == ACTION_CLOSE) motor_pos = 0x64;
+    else motor_pos = position;
+    return build_position_packet(this->hub_id_, motor_id, seq, motor_pos, this->swap_fields_);
+  }
+
+  uint8_t next_seq() {
+    if (this->have_overheard_seq_) {
+      this->seq_ = this->overheard_seq_ + 1;
+      this->have_overheard_seq_ = false;
+      ESP_LOGI(TAG, "Using overheard seq+1 = 0x%02x", this->seq_);
+    } else {
+      this->seq_++;
+    }
+    return this->seq_;
+  }
+
+  void set_overheard_seq(uint8_t seq) {
+    this->overheard_seq_ = seq;
+    this->have_overheard_seq_ = true;
+    ESP_LOGI(TAG, "Overheard seq = 0x%02x, next will be 0x%02x", seq, (uint8_t)(seq + 1));
+  }
+
+  void arm_piggyback_(const uint8_t *motor_id, uint8_t action, uint8_t position = 0) {
+    memcpy(this->piggyback_motor_, motor_id, 4);
+    this->piggyback_action_ = action;
+    this->piggyback_position_ = position;
+    this->piggyback_armed_ = true;
+    this->piggyback_armed_at_ = millis();
+    const char *act_name = action_name_(action);
+    ESP_LOGI(TAG, "Auto-piggyback ARMED: %s for motor %s (60s timeout)",
+             act_name, format_motor_id(motor_id).c_str());
+    char buf[80];
+    snprintf(buf, sizeof(buf), "ARMED %s %s", act_name, format_motor_id(motor_id).c_str());
+    this->piggyback_status_ = buf;
+  }
+
+  bool piggyback_expired_() const {
+    return this->piggyback_armed_ &&
+           (millis() - this->piggyback_armed_at_ > PIGGYBACK_TIMEOUT_MS);
+  }
+
+  // Rebuild follow-up packet with a fresh seq to avoid motor deduplication.
+  std::vector<uint8_t> build_followup_pkt_(uint8_t seq) {
+    if (this->followup_is_command_) {
+      return this->build_command_packet_(this->followup_motor_id_,
+                                          this->followup_action_,
+                                          this->followup_value_, seq);
+    }
+    return build_n4_command(this->hub_id_, this->followup_motor_id_, seq,
+                            this->followup_action_, this->followup_value_,
+                            this->swap_fields_);
+  }
+
+  // Send ACK back to motor after receiving its STATUS report.
+  // The Tuya hub does this; the motor may require it to send further reports.
+  void send_ack_to_motor_(const uint8_t *motor_id, uint8_t seq) {
+    std::vector<uint8_t> pkt = build_ack_packet(
+        this->hub_id_, motor_id, seq, 0x00, this->swap_fields_);
+    ESP_LOGD(TAG, "TX ACK→motor seq=0x%02x motor=%s",
+             seq, format_motor_id(motor_id).c_str());
+    this->transmit_command_only_(pkt, 1);
+  }
+
+  // Gap-free long preamble + command using CC1101 async serial mode.
+  //
+  // The hub's CMT2300A sends 800 bytes (160ms) of continuous 0xAA preamble
+  // followed seamlessly by sync + data.  The CC1101's packet mode creates
+  // 2-5ms gaps between packets that break the motor's preamble detection.
+  //
+  // Fix: use async serial mode to bit-bang the ENTIRE stream via GDO0
+  // with absolute timestamp-based timing to maintain exact symbol rate
+  // alignment with the CC1101's internal 40 kbps clock.
+  // Static TX buffer avoids heap allocation during the critical-section
+  // bit-bang, preventing heap corruption that crashes the SPI driver.
+  static constexpr int TX_BUF_MAX_ = 1600;
+  uint8_t tx_buf_[TX_BUF_MAX_];
+
+  // TX task state: the bit loop runs on a task pinned to core 1 so its
+  // interrupt-disabled stretches (up to ~51ms per 256-byte chunk) only
+  // affect core 1.  The main task blocks on tx_done_sem_ meanwhile, which
+  // keeps all CC1101 SPI access serialized in the caller's context.
+  TaskHandle_t tx_task_{nullptr};
+  SemaphoreHandle_t tx_start_sem_{nullptr};
+  SemaphoreHandle_t tx_done_sem_{nullptr};
+  int tx_total_{0};
+
+  static void tx_task_trampoline_(void *param) {
+    auto *hub = static_cast<SunfreeHub *>(param);
+    while (true) {
+      xSemaphoreTake(hub->tx_start_sem_, portMAX_DELAY);
+      hub->bitbang_bits_(hub->tx_total_);
+      xSemaphoreGive(hub->tx_done_sem_);
+    }
+  }
+
+  // The timing-critical bit loop.  Interrupts are disabled on the calling
+  // core to hold the 25us/bit symbol rate, released briefly every 256
+  // bytes so pending interrupts on this core can fire.
+  void bitbang_bits_(int total) {
+    int64_t t0 = esp_timer_get_time();
+    int bit_idx = 0;
+
+    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&mux);
+
+    for (int b = 0; b < total; b++) {
+      uint8_t byte = this->tx_buf_[b];
+      for (int bit = 7; bit >= 0; bit--) {
+        int64_t target = t0 + static_cast<int64_t>(bit_idx) * 25;
+        while (esp_timer_get_time() < target) {}
+        gpio_set_level(this->gdo0_pin_, (byte >> bit) & 1);
+        bit_idx++;
+      }
+      if ((b & 0xFF) == 0xFF) {
+        portEXIT_CRITICAL(&mux);
+        portENTER_CRITICAL(&mux);
+      }
+    }
+
+    portEXIT_CRITICAL(&mux);
+  }
+
+  void bitbang_tx_(int total) {
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    // TX at 433.933 MHz during pairing (motor WOR listens here),
+    // 433.950 MHz for normal commands (motor is already awake).
+    float tx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
+    this->radio_->set_frequency(tx_freq);
+    this->radio_->set_packet_mode(false);
+    this->radio_->begin_tx();
+
+    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_OUTPUT);
+
+    ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
+
+    int64_t t0 = esp_timer_get_time();
+
+    if (this->tx_task_ != nullptr) {
+      // Run the bit loop on core 1; block here (core 0 stays free for
+      // WiFi/lwIP tasks — only ESPHome's main loop pauses).
+      this->tx_total_ = total;
+      xSemaphoreGive(this->tx_start_sem_);
+      xSemaphoreTake(this->tx_done_sem_, portMAX_DELAY);
+    } else {
+      // Single-core build or task creation failed: run inline.
+      this->bitbang_bits_(total);
+    }
+
+    // Restore GDO0 as input before touching SPI again
+    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_INPUT);
+
+    // Get back into RX as fast as possible -- the motor's pairing response
+    // is a short burst that can arrive within milliseconds of our TX ending.
+    this->radio_->begin_rx();
+    this->radio_->set_packet_mode(true);
+    this->restore_rx_();
+
+    int64_t elapsed_us = esp_timer_get_time() - t0;
+    ESP_LOGD(TAG, "TX done (%lldms) f=%.3fMHz", elapsed_us / 1000, tx_freq / 1e6);
+  }
+
+  void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
+    ESP_LOGD(TAG, "TX preamble+cmd (%d bytes)", static_cast<int>(pkt.size()));
+
+    static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
+    int cmd_len = static_cast<int>(pkt.size()) - 2;
+    int total = PREAMBLE_BYTES + 4 + cmd_len + 10;
+    if (total > TX_BUF_MAX_) {
+      ESP_LOGE(TAG, "TX stream too large: %d > %d", total, TX_BUF_MAX_);
+      return;
+    }
+
+    int p = 0;
+    memset(this->tx_buf_, 0xAA, total);
+    p = PREAMBLE_BYTES;
+    this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
+    this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
+    for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
+
+    this->bitbang_tx_(total);
+  }
+
+  // Schedule follow-up retransmissions via loop().  Each follow-up is
+  // rebuilt with a fresh seq so the motor doesn't deduplicate by seq.
+  // is_command=true for movement commands (OPEN/CLOSE/STOP/POS),
+  // false for config/query commands (0x2A, 0x22, etc.)
+  void schedule_followups_(const uint8_t *motor_id, uint8_t action,
+                            uint8_t value, bool is_command = false) {
+    if (this->scan_active_) return;
+    memcpy(this->followup_motor_id_, motor_id, 4);
+    this->followup_action_ = action;
+    this->followup_value_ = value;
+    this->followup_is_command_ = is_command;
+    int count = is_command ? FOLLOWUP_COUNT_CMD : FOLLOWUP_COUNT_POLL;
+    this->followup_remaining_ = count;
+    this->followup_total_ = count;
+    this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
+    ESP_LOGD(TAG, "Scheduled %d follow-ups", count);
+  }
+
+  // Single preamble followed by multiple command packets, each with its own
+  // sync word.  All motors are awake from the WOR preamble so they all
+  // receive their command within milliseconds of each other.
+  // The command block is transmitted TWICE for redundancy — if a motor's
+  // WOR wake-up catches the tail of its first packet, the second copy
+  // provides another chance.
+  void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
+    static constexpr int PREAMBLE_BYTES = 800;
+    static constexpr int GAP_BYTES = 80;   // 16ms at 40kbps — gives motor time to process/ACK
+    static constexpr int REPEAT_COPIES = 2;
+
+    int block_bytes = 0;
+    for (auto &pkt : pkts) {
+      block_bytes += 4 + (static_cast<int>(pkt.size()) - 2) + GAP_BYTES;
+    }
+    int total = PREAMBLE_BYTES + (block_bytes * REPEAT_COPIES) + 10;
+    if (total > TX_BUF_MAX_) {
+      ESP_LOGE(TAG, "GROUP TX stream too large: %d > %d", total, TX_BUF_MAX_);
+      return;
+    }
+
+    memset(this->tx_buf_, 0xAA, total);
+    int p = PREAMBLE_BYTES;
+    for (int copy = 0; copy < REPEAT_COPIES; copy++) {
+      for (auto &pkt : pkts) {
+        this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
+        this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
+        for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
+        p += GAP_BYTES;
+      }
+    }
+
+    ESP_LOGI(TAG, "GROUP WOR: %d bytes (%dms), %d motors x%d copies",
+             total, total * 8 / 40, static_cast<int>(pkts.size()), REPEAT_COPIES);
+
+    this->bitbang_tx_(total);
+
+    // Schedule follow-ups with FRESH seq on each round (motors deduplicate
+    // by seq, so we must rebuild packets).
+    if (!this->followup_group_entries_.empty()) {
+      this->followup_group_remaining_ = FOLLOWUP_COUNT_GROUP;
+      this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
+      ESP_LOGD(TAG, "GROUP: scheduled %d follow-ups for %d motors",
+               FOLLOWUP_COUNT_GROUP,
+               static_cast<int>(this->followup_group_entries_.size()));
+    }
+  }
+
+  // Send just the command packet (no preamble), for piggyback or post-preamble.
+  // Retransmissions send the identical frame (same CRC); the motor deduplicates by SEQ.
+  void transmit_command_only_(std::vector<uint8_t> &pkt, int retries) {
+    this->radio_->set_idle();
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    this->radio_->set_sync1(0x53);
+    this->radio_->set_sync0(0x52);
+    this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
+    this->radio_->set_frequency(433950000.0f);
+    this->radio_->set_packet_length(static_cast<uint8_t>(pkt.size()));
+
+    for (int r = 0; r < retries; r++) {
+      auto err = this->radio_->transmit_packet(pkt);
+      if (err != cc1101::CC1101Error::NONE) {
+        ESP_LOGW(TAG, "TX err=%d retry %d/%d", static_cast<int>(err), r, retries);
+      }
+    }
+
+    // Restore RX configuration
+    this->restore_rx_();
+  }
+
+  void init_hub_id_() {
+    if (this->hub_id_from_yaml_) {
+      ESP_LOGI(TAG, "Hub ID from YAML: %s", format_motor_id(this->hub_id_).c_str());
+      return;
+    }
+
+    // Try loading from NVS
+    uint32_t stored_id = 0;
+    auto pref = global_preferences->make_preference<uint32_t>(fnv1_hash("sunfree_hub_id"));
+    if (pref.load(&stored_id) && stored_id != 0) {
+      memcpy(this->hub_id_, &stored_id, 4);
+      ESP_LOGI(TAG, "Hub ID from NVS: %s", format_motor_id(this->hub_id_).c_str());
+      return;
+    }
+
+    // Generate random hub ID
+    stored_id = esp_random();
+    while (stored_id == 0) stored_id = esp_random();
+    memcpy(this->hub_id_, &stored_id, 4);
+    pref.save(&stored_id);
+    global_preferences->sync();
+    ESP_LOGI(TAG, "Hub ID generated: %s (saved to NVS)", format_motor_id(this->hub_id_).c_str());
+  }
+
+  // Build the binary discovery frame (re-built each TX with incrementing seq).
+  void build_solicitation_frame_() {
+    this->solicit_frame_ = build_discovery_packet(this->hub_id_, this->next_seq());
+  }
+
+  void restore_rx_() {
+    this->radio_->set_idle();
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    // Always use 433.950 MHz for RX — RTL-SDR confirmed motor responds
+    // at ~433.935 MHz regardless of solicitation frequency (within the
+    // 203 kHz RX filter bandwidth centered on 433.950)
+    this->radio_->set_frequency(433950000.0f);
+    this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
+    this->radio_->set_sync1(0xD4);
+    this->radio_->set_sync0(0x92);
+    this->radio_->set_packet_length(CC1101_PKT_LEN);
+    this->radio_->begin_rx();
+  }
+
+#ifdef USE_WEBSERVER_BASE
+  void setup_web_();  // implemented in sunfree_web.h
+#endif
+};
+
+}  // namespace sunfree_blinds
+}  // namespace esphome
