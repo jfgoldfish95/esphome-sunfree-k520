@@ -3,7 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/api/custom_api_device.h"
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
 #include "esphome/components/web_server_base/web_server_base.h"
 #endif
 #include "esphome/components/cc1101/cc1101.h"
@@ -37,7 +37,7 @@ class SunfreeCover;
 class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
   void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
 #endif
   void set_hub_id(const std::string &id) {
@@ -51,6 +51,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // K520 "Radio+" motors (Blinds2go): post-pairing handshake, status request
   // by handshake, position from status byte 16.  See docs/k520-findings.md.
   void set_k520_mode(bool on) { this->k520_mode_ = on; }
+  // Length of the 0xAA wake-up preamble before each command.  The motors
+  // sleep and listen in bursts (WOR); a longer preamble is more likely to
+  // catch them.  40 kbit/s = 5 bytes per ms.
+  void set_wake_preamble_ms(uint32_t ms) { this->preamble_bytes_ = static_cast<int>(ms) * 5; }
   bool get_k520_mode() const { return this->k520_mode_; }
   int get_position_byte() const { return this->k520_mode_ ? 16 : 22; }
 
@@ -83,7 +87,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"group", "action"});
     ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
     if (this->web_base_) this->setup_web_();
 #endif
   }
@@ -97,6 +101,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGCONFIG(TAG, "  Covers: %u", static_cast<unsigned>(this->covers_.size()));
     ESP_LOGCONFIG(TAG, "  Groups: %u", static_cast<unsigned>(this->groups_.size()));
     ESP_LOGCONFIG(TAG, "  K520 mode: %s", YESNO(this->k520_mode_));
+    ESP_LOGCONFIG(TAG, "  Wake preamble: %d ms", this->preamble_bytes_ / 5);
   }
 
   void loop() override {
@@ -427,7 +432,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
   std::string get_motors_json();  // implemented in sunfree_web.h
 #endif
 
@@ -507,7 +512,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   cc1101::CC1101Component *radio_{nullptr};
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
   web_server_base::WebServerBase *web_base_{nullptr};
 #endif
   gpio_num_t gdo0_pin_{GPIO_NUM_4};
@@ -530,6 +535,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
   // K520 handshake / status-request queue
   bool k520_mode_{false};
+  int preamble_bytes_{800};
   struct HandshakeStep {
     uint8_t motor_id[4];
     uint8_t action;
@@ -742,7 +748,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // alignment with the CC1101's internal 40 kbps clock.
   // Static TX buffer avoids heap allocation during the critical-section
   // bit-bang, preventing heap corruption that crashes the SPI driver.
-  static constexpr int TX_BUF_MAX_ = 1600;
+  static constexpr int TX_BUF_MAX_ = 2400;  // room for a 300 ms preamble + group block
   uint8_t tx_buf_[TX_BUF_MAX_];
 
   // TX task state: the bit loop runs on a task pinned to core 1 so its
@@ -833,7 +839,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
     ESP_LOGD(TAG, "TX preamble+cmd (%d bytes)", static_cast<int>(pkt.size()));
 
-    static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
+    const int PREAMBLE_BYTES = this->preamble_bytes_;  // default 800 = 160 ms (original Tuya hub)
     int cmd_len = static_cast<int>(pkt.size()) - 2;
     int total = PREAMBLE_BYTES + 4 + cmd_len + 10;
     if (total > TX_BUF_MAX_) {
@@ -876,7 +882,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // WOR wake-up catches the tail of its first packet, the second copy
   // provides another chance.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
-    static constexpr int PREAMBLE_BYTES = 800;
+    const int PREAMBLE_BYTES = this->preamble_bytes_;
     static constexpr int GAP_BYTES = 80;   // 16ms at 40kbps — gives motor time to process/ACK
     static constexpr int REPEAT_COPIES = 2;
 
@@ -984,7 +990,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->begin_rx();
   }
 
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
   void setup_web_();  // implemented in sunfree_web.h
 #endif
 };

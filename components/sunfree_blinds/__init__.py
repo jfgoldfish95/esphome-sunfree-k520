@@ -4,6 +4,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_NAME
 from esphome.components.cc1101 import CC1101Component
+from esphome.components import web_server_base
 
 CODEOWNERS = ["@amasolov"]
 DEPENDENCIES = ["cc1101", "api"]
@@ -15,6 +16,8 @@ CONF_GDO0_PIN = "gdo0_pin"
 CONF_GROUPS = "groups"
 CONF_MOTOR_IDS = "motor_ids"
 CONF_K520_MODE = "k520_mode"
+CONF_WAKE_PREAMBLE = "wake_preamble"
+CONF_WEB_SERVER_BASE_ID = "web_server_base_id"
 
 
 def hex_id(value):
@@ -55,6 +58,19 @@ CONFIG_SCHEMA = cv.Schema(
         # Blinds2go K520 "Radio+" motors: post-pairing handshake, status
         # request by handshake, position from status byte 16.
         cv.Optional(CONF_K520_MODE, default=False): cv.boolean,
+        # Wake-up preamble before each command. 160 ms matches the original
+        # Tuya hub; the HackRF emulator used 250 ms on K520 motors.
+        cv.Optional(CONF_WAKE_PREAMBLE, default="160ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(
+                min=cv.TimePeriod(milliseconds=100),
+                max=cv.TimePeriod(milliseconds=300),
+            ),
+        ),
+        # Serves the component's page at /sunfree when web_server is used.
+        cv.OnlyWith(CONF_WEB_SERVER_BASE_ID, "web_server_base"): cv.use_id(
+            web_server_base.WebServerBase
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -70,6 +86,12 @@ async def to_code(config):
     cg.add(var.set_cc1101(cc1101))
     cg.add(var.set_gdo0_pin(config[CONF_GDO0_PIN]))
     cg.add(var.set_k520_mode(config[CONF_K520_MODE]))
+    cg.add(var.set_wake_preamble_ms(config[CONF_WAKE_PREAMBLE].total_milliseconds))
+
+    if CONF_WEB_SERVER_BASE_ID in config:
+        base = await cg.get_variable(config[CONF_WEB_SERVER_BASE_ID])
+        cg.add_define("USE_SUNFREE_WEB")
+        cg.add(var.set_web_base(base))
 
     for group in config.get(CONF_GROUPS, []):
         motor_ids = cg.RawExpression(

@@ -527,7 +527,7 @@ inline void SunfreeHub::send_group_command(const std::string &group,
 }  // namespace sunfree_blinds
 }  // namespace esphome
 
-#ifdef USE_WEBSERVER_BASE
+#ifdef USE_SUNFREE_WEB
 // Web UI — must come after SunfreeHub and SunfreeCover are fully defined
 #include "sunfree_web.h"
 #endif

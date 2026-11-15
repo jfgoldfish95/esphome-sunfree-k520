@@ -9,7 +9,7 @@ exactly as upstream.
 
 ```yaml
 external_components:
-  - source: github://jfgoldfish95/esphome-sunfree-k520@main
+  - source: github://jfgoldfish95/esphome-sunfree-k520@v0.1.0
     components: [sunfree_blinds]
 
 sunfree_blinds:
@@ -17,6 +17,7 @@ sunfree_blinds:
   cc1101_id: cc1101_radio
   hub_id: "xxxxxxxx"
   k520_mode: true
+  wake_preamble: 160ms      # optional, 100-300ms
 
 cover:
   - platform: sunfree_blinds
@@ -42,12 +43,32 @@ Found by driving real K520 motors with a HackRF-based hub emulator.
 - **Inverted covers.** K520 counts 100 as open. Use `invert_position: true`;
   the motor's opening/closing state is now swapped to match as well.
 
+## Other changes (any motor)
+
+- **`wake_preamble`**: length of the wake-up preamble before each command,
+  100-300 ms (default 160 ms, as upstream). The HackRF emulator used
+  250 ms on K520 motors; try that if sleeping motors don't respond.
+- **Public `request_status_all()`**, e.g. for an `on_boot` refresh:
+
+  ```yaml
+  esphome:
+    on_boot:
+      priority: -100
+      then:
+        - delay: 30s
+        - lambda: id(sunfree_hub).request_status_all();
+  ```
+
+- **Web page fixed.** Upstream's page at `/sunfree` was behind a
+  `USE_WEBSERVER_BASE` define that current ESPHome no longer sets, so it
+  never appeared. It now turns on whenever `web_server:` is in the config.
+
 Other K520 differences that need no code change: commands must go out at
 433.95 MHz (upstream already does), and the motors append one clear `00`
 byte to ACKs, status reports and pairing responses, which the existing
 length handling already copes with.
 
-Status: compiles for ESP32-S3 (ESPHome 2026.10); hardware test pending.
+Status: builds for ESP32-S3 (ESPHome 2026.10); hardware test pending.
 
 ## Licence
 
